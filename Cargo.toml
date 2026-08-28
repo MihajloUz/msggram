@@ -7,8 +7,8 @@ edition = "2024"
 axum = "0.8.9"
 axum-extra = { version = "0.10", features = ["cookie"] }
 tokio = {version = "1", features = ["full"]}
-tokio-postgres = "0.7" 
+tokio-postgres = { version = "0.7", features = ["with-uuid-1"] }
 dotenvy = "0.15"
 deadpool-postgres = "0.14"
 serde = {version = "1", features = ["derive"]}
-
+uuid = {version = "1", features = ["v4", "serde"]}
