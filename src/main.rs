@@ -1,11 +1,24 @@
-use axum::extract::State;
-use axum::{Form, Router, response::{Html, IntoResponse, Redirect}, routing::{get, post}};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::{
+    mpsc, 
+    RwLock,
+};
+use axum::{
+    Form, 
+    Router, 
+    response::{Html, 
+        IntoResponse, 
+        Redirect
+    }, 
+    routing::{get, post},
+    extract::{State, ws::{WebSocket, WebSocketUpgrade}},
+};
 use axum_extra::extract::cookie::{Cookie, CookieJar};
-use tokio::sync::mpsc;
 use deadpool_postgres::{Config, Runtime};
 use serde::Deserialize;
 use msggram::*;
-
+use tower_http::services::ServeDir;
 //async fn login_post(Form(data): Form<Login>) -> Redirect{
     //println!("email: {}", data.email);
     //println!("password: {}", data.password);
@@ -23,32 +36,23 @@ use msggram::*;
     //}
 //}
 
+
+//cookie extraction
 fn get_cookie(jar: &CookieJar, cookie_name: &str) -> Option<String> {
     jar.get(cookie_name).map(|cookie| cookie.value().to_string())
 }
-
-async fn home_handler(jar: CookieJar) -> Html<String> {
+//home
+async fn home_handler(jar: CookieJar) -> Result<Html<String>, ServerError> {
     if let Some(value) = get_cookie(&jar, "session_id"){
-        match tokio::fs::read_to_string("pages/home.html").await{
-            Ok(html) => Html(format!("{} \r\n\r\n {}", html, value.to_string())),
-            Err(err) => {
-                println!("Erorr reading pages/home.html");
-                Html("<h1>Error reading the pages/home.html</h1>".to_string())
-            }
-        }
-    } else{
-       match tokio::fs::read_to_string("pages/login.html").await{
-            Ok(html) => Html(html),
-            Err(err) => {
-                println!("Erorr reading pages/home.html");
-                Html("<h1>Error reading the pages/home.html</h1>".to_string())
-            }
-       }
+        Ok(Html(tokio::fs::read_to_string("pages/home.html").await?))
+    } 
+    else{
+        Ok(Html(tokio::fs::read_to_string("pages/login.html").await?))
     }
 }
 
-async fn login_handler(State(state): State<deadpool_postgres::Pool>, jar: CookieJar, Form(data): Form<Login>) -> Result<(CookieJar, Redirect), ServerError> {
-    let client = state.get().await?;
+async fn login_handler(State(state): State<AppState>, jar: CookieJar, Form(data): Form<Login>) -> Result<(CookieJar, Redirect), ServerError> {
+    let client = state.db.get().await?;
     let row = client.query_opt(
         "SELECT id, nickname, password FROM users WHERE email = $1", 
         &[&data.email]
@@ -66,7 +70,6 @@ async fn login_handler(State(state): State<deadpool_postgres::Pool>, jar: Cookie
         return Err(ServerError::UserCredentialsError(UserDataError::InvalidCredentials));
     }
 
-
     let row = client.query_one(
         "INSERT INTO sessions (user_id) VALUES ($1) RETURNING session_id",
         &[&user_id]
@@ -82,19 +85,11 @@ async fn login_handler(State(state): State<deadpool_postgres::Pool>, jar: Cookie
     Ok((jar.add(cookie), Redirect::to("/")))
 }
 
-async fn loading_register() -> Html<String>{
-    match tokio::fs::read_to_string("pages/register.html").await{
-        Ok(html) => Html(html),
-        Err(err) => {
-            println!("Erorr reading pages/home.html");
-            Html("<h1>Error reading the pages/home.html</h1>".to_string())
-        }
-    }
-}
+async fn loading_register() -> Result<Html<String>, ServerError>{Ok(Html(tokio::fs::read_to_string("pages/register.html").await?))}
 
-async fn register_handler(State(state): State<deadpool_postgres::Pool>, Form(data): Form<Register>) -> Result<Redirect, ServerError>{
+async fn register_handler(State(state): State<AppState>, Form(data): Form<Register>) -> Result<Redirect, ServerError>{
     checking_user_data(data.clone())?;
-    let client = state.get().await?;
+    let client = state.db.get().await?;
 
     client.execute(
         "INSERT INTO users (nickname, email, password) VALUES ($1, $2, $3)",
@@ -104,16 +99,67 @@ async fn register_handler(State(state): State<deadpool_postgres::Pool>, Form(dat
     Ok(Redirect::to("/"))
 }
 
-fn create_app(pool: deadpool_postgres::Pool) -> Router{
+//websocket and msg sending handling
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| async move {
+        if let Err(e) = handle_socket(socket, state, jar).await {
+            eprintln!("websocket error: {e}");
+        }
+    })
+}
+
+async fn handle_socket(
+    mut socket: WebSocket,
+    state: AppState,
+    jar: CookieJar,
+) -> Result<(), ServerError> {
+    let (rx, mut tx) = mpsc::unbounded_channel::<Message>();
+
+    let session_id: uuid::Uuid = match get_cookie(&jar, "session_id"){
+        Some(value) => value.parse().unwrap(),
+        None => return Err(ServerError::UserCredentialsError(UserDataError::InvalidCredentials)),
+    }; 
+
+    let client = state.db.get().await?;
+    let row = client.query_opt(
+        "SELECT user_id FROM sessions 
+        INNER JOIN users ON users.id = sessions.user_id
+        WHERE sessions.session_id = $1", 
+        &[&session_id]
+    ).await?;
+   
+    let user_id: uuid::Uuid = match row {
+        Some(row) => row.get("user_id"),
+        None => {
+            return Err(ServerError::UserCredentialsError(
+                UserDataError::InvalidCredentials
+            ));
+        }
+    };
+   
+    let mut users = state.users.write().await;
+    users.insert(user_id, tx);
+
+    Ok(())
+}
+
+fn create_app(state: AppState) -> Router{
     Router::new()
         .route("/", get(home_handler))
         .route("/register", get(loading_register).post(register_handler))
         .route("/login", post(login_handler))
-        .with_state(pool)
+        .route("/ws", get(ws_handler))
+        .nest_service("/img", ServeDir::new("pages/img"))
+        .nest_service("/js", ServeDir::new("pages/js"))
+        .with_state(state)
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>>{
+async fn main() -> Result<(), ServerError>{
     dotenvy::dotenv().ok();
     let (client, connection) = tokio_postgres::connect(
         format!("host={} user={} password={} dbname={}",
@@ -149,12 +195,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>>{
         }
     });
 
-
     let pool = create_pool()?;
+    let state = AppState {
+        db: pool,
+        users: Arc::new(RwLock::new(HashMap::new())),
+    };
 
-    setting_up_db(&pool).await?;
-
-    let app = create_app(pool);
+    let app = create_app(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
 
     axum::serve(listener, app).await?;

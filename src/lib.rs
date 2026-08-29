@@ -1,10 +1,12 @@
 use axum::{http::StatusCode, response::IntoResponse};
 use serde::Deserialize;
-use std::{fmt, env};
+use uuid::Uuid;
+use std::{fmt, env, collections::HashMap, sync::Arc};
 use deadpool_postgres::{
     Config, 
     Runtime, 
 };
+use tokio::sync::{mpsc, RwLock};
 
 #[derive(Debug)]
 pub enum UserDataError{
@@ -104,7 +106,7 @@ impl IntoResponse for ServerError{
             ServerError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
             ServerError::Env(_) => StatusCode::INTERNAL_SERVER_ERROR,
             ServerError::UserCredentialsError(_) => StatusCode::BAD_REQUEST,
-        };
+};
 
         (status, self.to_string()).into_response()
     }
@@ -205,10 +207,16 @@ pub async fn setting_up_db(pool: &deadpool_postgres::Pool) -> Result<(), deadpoo
 
     Ok(())
 }
-
-
-
-pub fn user_insert() -> Result<(), ServerError>{
-    Ok(())
+//App state and msg receiving
+#[derive(Deserialize)]
+pub struct Message{
+    receiver_id: Uuid,
+    session_id: Uuid,
+    contents: String,
 }
 
+#[derive(Clone)]
+pub struct AppState{
+    pub db: deadpool_postgres::Pool,
+    pub users: Arc<RwLock<HashMap<Uuid, mpsc::UnboundedSender<Message>>>>,
+}

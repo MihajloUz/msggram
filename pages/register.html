@@ -2,15 +2,23 @@
 <html lang="en">
     <head>
         <meta charset="utf-8">
-        <title>Hello!</title>
+        <title>msggram — Register in</title>
     </head>
     <body>
-        <form action="/register" method="post">
-            <input type="text" name="nickname">
-            <input type="text" name="email">
-            <input type="password" name="password">
-            <button type="submit">Register</button>
-        </form>
-        <p>Hello im Dima Madiudia</p>
+        <div id="logo">
+            <a href="/"><img src="img/logo.png"></a>
+        </div>
+        <div id="register_box">
+            <form action="/register" method="post">
+                <p>Nickname</p>
+                <input type="text" name="nickname" placeholder="Nickname...">
+                <p>Email</p>
+                <input type="text" name="email" placeholder="example@gmail.com">
+                <p>Password</p>
+                <input type="password" name="password" placeholder="">
+                <button type="submit">Register</button>
+            </form>
+            <p>Already have an account? <a href="/">Log in</a></p>
+        </div> 
     </body>
 </html>
