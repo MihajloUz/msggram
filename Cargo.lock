@@ -615,6 +615,7 @@ dependencies = [
  "deadpool-postgres",
  "dotenvy",
  "serde",
+ "serde_json",
  "tokio",
  "tokio-postgres",
  "tower-http",

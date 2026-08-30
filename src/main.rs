@@ -19,23 +19,6 @@ use deadpool_postgres::{Config, Runtime};
 use serde::Deserialize;
 use msggram::*;
 use tower_http::services::ServeDir;
-//async fn login_post(Form(data): Form<Login>) -> Redirect{
-    //println!("email: {}", data.email);
-    //println!("password: {}", data.password);
-   // 
-    //Redirect::to("/")
-//}
-
-//async fn check() -> Html<String> {
-    //match tokio::fs::read_to_string("pages/home.html").await{
-        //Ok(html) => Html(html),
-        //Err(err) => {
-            //println!("Erorr reading pages/home.html");
-            //Html("<h1>Error reading the pages/home.html</h1>".to_string())
-        //}
-    //}
-//}
-
 
 //cookie extraction
 fn get_cookie(jar: &CookieJar, cookie_name: &str) -> Option<String> {
@@ -59,7 +42,7 @@ async fn login_handler(State(state): State<AppState>, jar: CookieJar, Form(data)
     ).await?;
 
     let Some(row) = row else{
-        return Err(ServerError::UserCredentialsError(UserDataError::InvalidCredentials));
+        return Err(ServerError::UserDataError(UserDataError::InvalidCredentials));
     };
 
     let user_id: uuid::Uuid = row.get("id");
@@ -67,7 +50,7 @@ async fn login_handler(State(state): State<AppState>, jar: CookieJar, Form(data)
     let stored_password: String = row.get("password");
 
     if data.password != stored_password {
-        return Err(ServerError::UserCredentialsError(UserDataError::InvalidCredentials));
+        return Err(ServerError::UserDataError(UserDataError::InvalidCredentials));
     }
 
     let row = client.query_one(
@@ -107,7 +90,7 @@ async fn ws_handler(
 ) -> impl IntoResponse {
     ws.on_upgrade(move |socket| async move {
         if let Err(e) = handle_socket(socket, state, jar).await {
-            eprintln!("websocket error: {e}");
+            eprintln!("Websocket error: {e}");
         }
     })
 }
@@ -117,32 +100,61 @@ async fn handle_socket(
     state: AppState,
     jar: CookieJar,
 ) -> Result<(), ServerError> {
-    let (rx, mut tx) = mpsc::unbounded_channel::<Message>();
+    let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
 
     let session_id: uuid::Uuid = match get_cookie(&jar, "session_id"){
-        Some(value) => value.parse().unwrap(),
-        None => return Err(ServerError::UserCredentialsError(UserDataError::InvalidCredentials)),
+        Some(value) => { match value.parse() {
+            Ok(value) => value,
+            Err(_) => return Err(ServerError::HandleSocketError(HandleSocketError::ParsingCookie)),
+        } }
+        None => return Err(ServerError::HandleSocketError(HandleSocketError::RetrievingCookie)),
     }; 
 
     let client = state.db.get().await?;
     let row = client.query_opt(
-        "SELECT user_id FROM sessions 
+       "SELECT user_id FROM sessions 
         INNER JOIN users ON users.id = sessions.user_id
-        WHERE sessions.session_id = $1", 
+        WHERE sessions.session_id = $1 AND sessions.expires_at > NOW()", 
         &[&session_id]
     ).await?;
    
     let user_id: uuid::Uuid = match row {
         Some(row) => row.get("user_id"),
-        None => {
-            return Err(ServerError::UserCredentialsError(
-                UserDataError::InvalidCredentials
-            ));
-        }
+        None => return Err(ServerError::HandleSocketError(HandleSocketError::UserNotFound)),
     };
-   
+  
+    println!("{:?}", user_id);
+
     let mut users = state.users.write().await;
     users.insert(user_id, tx);
+    drop(users);
+    loop{
+        tokio::select! {
+            //receiving msg from socket 
+            Some(msg) = rx.recv() => {
+                let json = serde_json::to_string(&msg)?;
+
+                socket
+                    .send(axum::extract::ws::Message::Text(json.into()))
+                    .await?;
+            }
+
+            //writing a msg to socket 
+            Some(Ok(ws_msg)) = socket.recv() => {
+                if let axum::extract::ws::Message::Text(text) = ws_msg {
+                    let msg: Message = serde_json::from_str(&text)?;
+                    let users = state.users.read().await;
+
+                    if let Some(receiver_tx) = users.get(&msg.receiver_id){
+                        let _ = receiver_tx.send(msg);
+                    }
+                }
+            }
+            else => {
+                break;
+            }
+        }
+    }   
 
     Ok(())
 }
@@ -196,13 +208,14 @@ async fn main() -> Result<(), ServerError>{
     });
 
     let pool = create_pool()?;
+    setting_up_db(&pool).await?;
     let state = AppState {
         db: pool,
         users: Arc::new(RwLock::new(HashMap::new())),
     };
 
     let app = create_app(state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:80").await?;
 
     axum::serve(listener, app).await?;
     Ok(())

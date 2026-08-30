@@ -1,5 +1,5 @@
-use axum::{http::StatusCode, response::IntoResponse};
-use serde::Deserialize;
+use axum::{extract::ws::WebSocket, http::StatusCode, response::IntoResponse};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use std::{fmt, env, collections::HashMap, sync::Arc};
 use deadpool_postgres::{
@@ -63,15 +63,44 @@ pub fn checking_user_data(data: Register) -> Result<(), UserDataError>{
 }
 
 #[derive(Debug)]
+pub enum HandleSocketError{
+    RetrievingCookie,
+    ParsingCookie,
+    UserNotFound,
+}
+
+impl fmt::Display for HandleSocketError{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self { 
+            HandleSocketError::RetrievingCookie => {
+                write!(f, "Error retrieving cookie")
+            }
+            HandleSocketError::ParsingCookie => {
+                write!(f, "Error parsing cookie")
+            }
+            HandleSocketError::UserNotFound => {
+                write!(f, "Error user not found")
+            }
+        } 
+    }
+}
+
+impl std::error::Error for HandleSocketError {}
+
+#[derive(Debug)]
 pub enum ServerError{
     TokioDb(tokio_postgres::Error),
     DeadpoolDb(deadpool_postgres::PoolError),
     PoolCreation(deadpool_postgres::CreatePoolError),
     Io(std::io::Error),
     Env(env::VarError),
-    
-    UserCredentialsError(UserDataError),
+    SerdeJson(serde_json::Error),
+    Axum(axum::Error),
+
+    HandleSocketError(HandleSocketError),
+    UserDataError(UserDataError),
 }
+
 
 impl fmt::Display for ServerError{
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result{
@@ -91,7 +120,18 @@ impl fmt::Display for ServerError{
             ServerError::Env(e) => {
                 write!(f, ".env erorr: {}", e)
             }
-            ServerError::UserCredentialsError(e) => {
+            ServerError::SerdeJson(e) => {
+                write!(f, "{}", e)
+            }
+            ServerError::Axum(e) => {
+                write!(f, "{}", e)
+            }
+
+
+            ServerError::HandleSocketError(e) => {
+                write!(f, "WebSocket error: {}", e)
+            }
+            ServerError::UserDataError(e) => {
                 write!(f, "{}", e)
             }
         }
@@ -105,12 +145,16 @@ impl IntoResponse for ServerError{
             ServerError::PoolCreation(_) => StatusCode::INTERNAL_SERVER_ERROR,
             ServerError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
             ServerError::Env(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            ServerError::UserCredentialsError(_) => StatusCode::BAD_REQUEST,
+            ServerError::SerdeJson(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            ServerError::Axum(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            ServerError::HandleSocketError(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            ServerError::UserDataError(_) => StatusCode::BAD_REQUEST,
 };
 
         (status, self.to_string()).into_response()
     }
 }
+
 
 impl From<tokio_postgres::Error> for ServerError{
     fn from(e: tokio_postgres::Error) -> Self{
@@ -142,9 +186,27 @@ impl From<env::VarError> for ServerError{
     }
 }
 
+impl From<serde_json::Error> for ServerError{
+    fn from(e: serde_json::Error) -> Self {
+        ServerError::SerdeJson(e) 
+    }
+}
+
+impl From<axum::Error> for ServerError{
+    fn from(e: axum::Error) -> Self {
+        ServerError::Axum(e) 
+    }
+}
+
 impl From<UserDataError> for ServerError{
     fn from(e: UserDataError) -> Self{
-        ServerError::UserCredentialsError(e)
+        ServerError::UserDataError(e)
+    }
+}
+
+impl From<HandleSocketError> for ServerError{
+    fn from(e: HandleSocketError) -> Self {
+        ServerError::HandleSocketError(e)
     }
 }
 
@@ -182,9 +244,10 @@ pub async fn setting_up_db(pool: &deadpool_postgres::Pool) -> Result<(), deadpoo
     client.batch_execute(
         "
         CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
         CREATE TABLE IF NOT EXISTS users (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-            nickname TEXT NOT NULL,
+            nickname TEXT NOT NULL UNIQUE,
             email TEXT NOT NULL UNIQUE,
             password TEXT NOT NULL
         );
@@ -197,22 +260,28 @@ pub async fn setting_up_db(pool: &deadpool_postgres::Pool) -> Result<(), deadpoo
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
 
-        CREATE TABLE IF NOT EXISTS sessions(
+        CREATE TABLE IF NOT EXISTS sessions (
             session_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
             user_id UUID NOT NULL REFERENCES users(id),
-            expires_at TIMESTAMPTZ NOT NULL DEFAULT NOW() + INVERVAL '7 days'
+            expires_at TIMESTAMPTZ NOT NULL DEFAULT NOW() + INTERVAL '7 days'
         );
+
+        CREATE TABLE IF NOT EXISTS contacts (
+            user_id UUID REFERENCES users(id),
+            contacts_id UUID REFERENCES users(id),
+            PRIMARY KEY (user_id, contacts_id)
+        );
+
         "
     ).await?;
 
     Ok(())
 }
 //App state and msg receiving
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Message{
-    receiver_id: Uuid,
-    session_id: Uuid,
-    contents: String,
+    pub receiver_id: Uuid,
+    pub contents: String,
 }
 
 #[derive(Clone)]
