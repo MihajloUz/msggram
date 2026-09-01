@@ -250,7 +250,7 @@ pub async fn setting_up_db(pool: &deadpool_postgres::Pool) -> Result<(), deadpoo
     client.batch_execute(
         "
         CREATE EXTENSION IF NOT EXISTS pgcrypto;
-        
+
         CREATE TABLE IF NOT EXISTS users (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
             nickname TEXT NOT NULL UNIQUE,
@@ -277,7 +277,6 @@ pub async fn setting_up_db(pool: &deadpool_postgres::Pool) -> Result<(), deadpoo
             contacts_id UUID REFERENCES users(id),
             PRIMARY KEY (user_id, contacts_id)
         );
-
         "
     ).await?;
 
