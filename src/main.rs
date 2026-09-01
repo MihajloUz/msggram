@@ -18,9 +18,63 @@ fn get_cookie(jar: &CookieJar, cookie_name: &str) -> Option<String> {
     jar.get(cookie_name).map(|cookie| cookie.value().to_string())
 }
 //home
-async fn home_handler(jar: CookieJar) -> Result<Html<String>, ServerError> {
+async fn home_handler(jar: CookieJar, State(state): State<AppState>) -> Result<Html<String>, ServerError> {
     if let Some(value) = get_cookie(&jar, "session_id"){
-        Ok(Html(tokio::fs::read_to_string("pages/home.html").await?))
+        let mut page = tokio::fs::read_to_string("pages/home.html").await?; 
+        
+        let session_id: uuid::Uuid = value.parse()
+            .map_err(|_| ServerError::HandleSocketError(HandleSocketError::ParsingCookie))?;
+
+
+
+        let client = state.db.get().await?;
+        
+        let rows = client.query_opt(
+            "SELECT user_id FROM sessions
+            WHERE session_id = $1 AND expires_at > NOW()", &[&session_id]
+        ).await?;
+
+        let Some(row) = rows else{
+            return Ok(Html(tokio::fs::read_to_string("pages/login.html").await?))
+        };
+        let user_id: uuid::Uuid = row.get("user_id");
+
+        let rows = client.query(
+            "SELECT contacts.contacts_id, users.nickname FROM contacts 
+            INNER JOIN users ON users.id = contacts.contacts_id
+            WHERE contacts.user_id = $1
+            ", 
+            &[&user_id]
+        ).await?;
+        
+        let mut contacts: HashMap<uuid::Uuid, String> = HashMap::new();
+        for row in rows{
+            let contacts_id = row.get("contacts_id");
+            let nickname = row.get("nickname");
+            println!("{}", contacts_id);
+            println!("{}", nickname);
+            contacts.insert(contacts_id, nickname);
+        }
+
+        println!("{:?}", contacts);
+        let html = {
+            if contacts.is_empty(){
+                //no contacts available
+                String::from("")
+            } 
+            else{
+                let mut buffer_string: String = String::new();
+                for (id, nickname) in &contacts{
+                    let button = format!("<button class='user' data-user-id='{id}'>{nickname}</button>"); 
+                    buffer_string.push_str(button.as_str());
+                }
+                buffer_string
+            }
+
+        };
+        println!("{}", html);
+        page = page.replace("Contacts", html.as_str());
+        Ok(Html(page))
     } 
     else{
         Ok(Html(tokio::fs::read_to_string("pages/login.html").await?))
@@ -250,13 +304,11 @@ async fn handle_socket(
             Some(Ok(ws_msg)) = socket.recv() => {
                 if let axum::extract::ws::Message::Text(text) = ws_msg {
                     let msg: Message = serde_json::from_str(&text)?;
-
                     client.execute(
-                        "INSERT INTO messages(sender_id, requested_id, contents) 
+                        "INSERT INTO messages(sender_id, received_id, contents) 
                         VALUES ($1, $2, $3)",
                         &[&user_id, &msg.receiver_id, &msg.contents]
                     ).await?;
-
                     let users = state.users.read().await;
 
                     if let Some(receiver_tx) = users.get(&msg.receiver_id){
