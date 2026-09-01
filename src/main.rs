@@ -99,37 +99,34 @@ async fn add_contact_handler(
         let user_id: uuid::Uuid = match row {
             Some(row) => row.get("user_id"),
             None => {
-                let mut messages_html = String::from("<h1>Error finding that user, try again</h1>");
-
-                let page = template.replace("{{MESSAGES}}", &messages_html);
-                return Ok(Html(page).into_response());
+                return Ok(Html(template.replace("Type a username", "<h1>Error finding that user, try again</h1>")).into_response());
             } 
         };
-        let page = match client.query_opt(
+        let messages_html: String = match client.query_opt(
            "SELECT id FROM users WHERE users.nickname = $1", 
             &[&data.nickname]
         ).await{
             Ok(Some(row)) => {
                 let contacts_id: uuid::Uuid = row.get("id");
-                client.execute(
+                match client.execute(
                     "INSERT INTO contacts(user_id, contacts_id) 
                     VALUES ($1, $2)",
                     &[&user_id, &contacts_id]
-                ).await?;
-
-                let messages_html = String::from("<h1>User was added to your contacts</h1>");
-                let page = template.replace("{{MESSAGES}}", &messages_html);
-                page
+                ).await {
+                    Ok(_) => {
+                        String::from("<h1>User was added to your contacts</h1>")
+                    },
+                    Err(_) => {
+                        String::from("<h1>User is already in your contacts</h1>")
+                    }
+                }
             }
             Ok(None) => {
-                let messages_html = String::from("<h1>Error finding that user, try again</h1>");
-
-                let page = template.replace("{{MESSAGES}}", &messages_html);
-                page
+                String::from("<h1>Error finding that user, try again</h1>")
             }
             Err(e) => return Err(ServerError::TokioDb(e)),
         };
-        Ok(Html(page).into_response())
+        Ok(Html(template.replace("Type a username", &messages_html)).into_response())
     } 
     else{
         return Ok(Redirect::to("/login").into_response());
