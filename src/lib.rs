@@ -212,6 +212,8 @@ impl From<HandleSocketError> for ServerError{
 
 impl std::error::Error for ServerError{}
 
+
+//Form's 
 #[derive(Deserialize, Clone)]
 pub struct Register{
     pub nickname: String,
@@ -225,6 +227,10 @@ pub struct Login{
     pub password: String,
 }
 
+#[derive(Deserialize, Clone)]
+pub struct AddContact{
+    pub nickname: String,
+}
 
 //db
 pub fn create_pool() -> Result<deadpool_postgres::Pool, ServerError>{
@@ -244,7 +250,7 @@ pub async fn setting_up_db(pool: &deadpool_postgres::Pool) -> Result<(), deadpoo
     client.batch_execute(
         "
         CREATE EXTENSION IF NOT EXISTS pgcrypto;
-
+        
         CREATE TABLE IF NOT EXISTS users (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
             nickname TEXT NOT NULL UNIQUE,
@@ -255,7 +261,7 @@ pub async fn setting_up_db(pool: &deadpool_postgres::Pool) -> Result<(), deadpoo
         CREATE TABLE IF NOT EXISTS messages (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
             sender_id UUID NOT NULL REFERENCES users(id),
-            request_id UUID NOT NULL REFERENCES users(id),
+            received_id UUID NOT NULL REFERENCES users(id),
             contents TEXT NOT NULL,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );

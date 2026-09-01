@@ -5,14 +5,8 @@ use tokio::sync::{
     RwLock,
 };
 use axum::{
-    Form, 
-    Router, 
-    response::{Html, 
-        IntoResponse, 
-        Redirect
-    }, 
+    Form, Router, extract::{State, ws::{WebSocket, WebSocketUpgrade}}, response::{Html, IntoResponse, Redirect, Response}, 
     routing::{get, post},
-    extract::{State, ws::{WebSocket, WebSocketUpgrade}},
 };
 use axum_extra::extract::cookie::{Cookie, CookieJar};
 use deadpool_postgres::{Config, Runtime};
@@ -82,6 +76,66 @@ async fn register_handler(State(state): State<AppState>, Form(data): Form<Regist
     Ok(Redirect::to("/"))
 }
 
+//adding new user
+async fn loading_add_contact() -> Result<Html<String>, ServerError>{Ok(Html(tokio::fs::read_to_string("pages/add_contact.html").await?))}
+async fn add_contact_handler(
+        State(state): State<AppState>, 
+        jar: CookieJar,
+        Form(data): Form<AddContact>
+    )-> Result<Response, ServerError> {
+
+    let template = tokio::fs::read_to_string("pages/add_contact.html").await?; 
+    let client = state.db.get().await?;
+   
+    if let Some(value) = get_cookie(&jar, "session_id"){
+        let session_id: uuid::Uuid = value.parse()
+            .map_err(|_| ServerError::HandleSocketError(
+                HandleSocketError::ParsingCookie
+            ))?;
+        let row = client.query_opt("
+                SELECT user_id FROM sessions 
+                WHERE sessions.session_id = $1 AND expires_at > NOW() 
+            ", &[&session_id]).await?;
+        let user_id: uuid::Uuid = match row {
+            Some(row) => row.get("user_id"),
+            None => {
+                let mut messages_html = String::from("<h1>Error finding that user, try again</h1>");
+
+                let page = template.replace("{{MESSAGES}}", &messages_html);
+                return Ok(Html(page).into_response());
+            } 
+        };
+        let page = match client.query_opt(
+           "SELECT id FROM users WHERE users.nickname = $1", 
+            &[&data.nickname]
+        ).await{
+            Ok(Some(row)) => {
+                let contacts_id: uuid::Uuid = row.get("id");
+                client.execute(
+                    "INSERT INTO contacts(user_id, contacts_id) 
+                    VALUES ($1, $2)",
+                    &[&user_id, &contacts_id]
+                ).await?;
+
+                let messages_html = String::from("<h1>User was added to your contacts</h1>");
+                let page = template.replace("{{MESSAGES}}", &messages_html);
+                page
+            }
+            Ok(None) => {
+                let messages_html = String::from("<h1>Error finding that user, try again</h1>");
+
+                let page = template.replace("{{MESSAGES}}", &messages_html);
+                page
+            }
+            Err(e) => return Err(ServerError::TokioDb(e)),
+        };
+        Ok(Html(page).into_response())
+    } 
+    else{
+        return Ok(Redirect::to("/login").into_response());
+    }
+}
+
 //websocket and msg sending handling
 async fn ws_handler(
     ws: WebSocketUpgrade,
@@ -143,6 +197,13 @@ async fn handle_socket(
             Some(Ok(ws_msg)) = socket.recv() => {
                 if let axum::extract::ws::Message::Text(text) = ws_msg {
                     let msg: Message = serde_json::from_str(&text)?;
+
+                    client.execute(
+                        "INSERT INTO messages(sender_id, requested_id, contents) 
+                        VALUES ($1, $2, $3)",
+                        &[&user_id, &msg.receiver_id, &msg.contents]
+                    ).await?;
+
                     let users = state.users.read().await;
 
                     if let Some(receiver_tx) = users.get(&msg.receiver_id){
@@ -164,6 +225,7 @@ fn create_app(state: AppState) -> Router{
         .route("/", get(home_handler))
         .route("/register", get(loading_register).post(register_handler))
         .route("/login", post(login_handler))
+        .route("/add_contact", get(loading_add_contact).post(add_contact_handler))
         .route("/ws", get(ws_handler))
         .nest_service("/img", ServeDir::new("pages/img"))
         .nest_service("/js", ServeDir::new("pages/js"))
@@ -215,7 +277,7 @@ async fn main() -> Result<(), ServerError>{
     };
 
     let app = create_app(state);
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:80").await?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
 
     axum::serve(listener, app).await?;
     Ok(())
