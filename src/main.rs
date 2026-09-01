@@ -5,8 +5,7 @@ use tokio::sync::{
     RwLock,
 };
 use axum::{
-    Form, Router, extract::{State, ws::{WebSocket, WebSocketUpgrade}}, response::{Html, IntoResponse, Redirect, Response}, 
-    routing::{get, post},
+    Form, Router, extract::{Query, State, ws::{WebSocket, WebSocketUpgrade}}, response::{Html, IntoResponse, Redirect, Response}, routing::{get, post},
 };
 use axum_extra::extract::cookie::{Cookie, CookieJar};
 use deadpool_postgres::{Config, Runtime};
@@ -77,14 +76,30 @@ async fn register_handler(State(state): State<AppState>, Form(data): Form<Regist
 }
 
 //adding new user
-async fn loading_add_contact() -> Result<Html<String>, ServerError>{Ok(Html(tokio::fs::read_to_string("pages/add_contact.html").await?))}
+#[derive(Deserialize, Debug)]
+struct AddContactMessage{
+    message: Option<String>,
+}
+async fn loading_add_contact(Query(query): Query<AddContactMessage>) -> Result<Html<String>, ServerError>{
+    let mut page = tokio::fs::read_to_string("pages/add_contact.html").await?; 
+    if let Some(message) = query.message {
+        let html = match message.as_str() {
+            "error_finding_user" => "<h1>Error finding that user</h1>",
+            "already_in_contacts" => "<h1>User already in contacts</h1>",
+            "user_added" => "<h1>User added successfully</h1>",
+            _ => "", 
+        };
+        page = page.replace("Type a username", html);
+    } 
+
+    Ok(Html(page))
+}
 async fn add_contact_handler(
         State(state): State<AppState>, 
         jar: CookieJar,
         Form(data): Form<AddContact>
-    )-> Result<Response, ServerError> {
+    )-> Result<Redirect, ServerError> {
 
-    let template = tokio::fs::read_to_string("pages/add_contact.html").await?; 
     let client = state.db.get().await?;
    
     if let Some(value) = get_cookie(&jar, "session_id"){
@@ -99,10 +114,10 @@ async fn add_contact_handler(
         let user_id: uuid::Uuid = match row {
             Some(row) => row.get("user_id"),
             None => {
-                return Ok(Html(template.replace("Type a username", "<h1>Error finding that user, try again</h1>")).into_response());
+                return Ok(Redirect::to("/add_contact?message=error_finding_user"));
             } 
         };
-        let messages_html: String = match client.query_opt(
+        let result: Result<Redirect, ServerError> = match client.query_opt(
            "SELECT id FROM users WHERE users.nickname = $1", 
             &[&data.nickname]
         ).await{
@@ -114,22 +129,22 @@ async fn add_contact_handler(
                     &[&user_id, &contacts_id]
                 ).await {
                     Ok(_) => {
-                        String::from("<h1>User was added to your contacts</h1>")
+                        Ok(Redirect::to("/add_contact?message=user_added"))
                     },
                     Err(_) => {
-                        String::from("<h1>User is already in your contacts</h1>")
+                        Ok(Redirect::to("/add_contact?message=already_in_contacts"))
                     }
                 }
             }
             Ok(None) => {
-                String::from("<h1>Error finding that user, try again</h1>")
+                Ok(Redirect::to("/add_contact?message=error_finding_user"))
             }
             Err(e) => return Err(ServerError::TokioDb(e)),
         };
-        Ok(Html(template.replace("Type a username", &messages_html)).into_response())
+        result
     } 
     else{
-        return Ok(Redirect::to("/login").into_response());
+        return Ok(Redirect::to("/login"));
     }
 }
 
