@@ -1,337 +1,27 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{
-    mpsc, 
     RwLock,
 };
 use axum::{
-    Form, Router, extract::{Query, State, ws::{WebSocket, WebSocketUpgrade}}, response::{Html, IntoResponse, Redirect, Response}, routing::{get, post},
+    Router, routing::get,
 };
-use axum_extra::extract::cookie::{Cookie, CookieJar};
-use deadpool_postgres::{Config, Runtime};
-use serde::Deserialize;
 use msggram::*;
 use tower_http::services::ServeDir;
 
-//cookie extraction
-fn get_cookie(jar: &CookieJar, cookie_name: &str) -> Option<String> {
-    jar.get(cookie_name).map(|cookie| cookie.value().to_string())
-}
-//home
-async fn home_handler(jar: CookieJar, State(state): State<AppState>) -> Result<Html<String>, ServerError> {
-    if let Some(value) = get_cookie(&jar, "session_id"){
-        let mut page = tokio::fs::read_to_string("pages/home.html").await?; 
-        
-        let session_id: uuid::Uuid = value.parse()
-            .map_err(|_| ServerError::HandleSocketError(HandleSocketError::ParsingCookie))?;
-
-
-
-        let client = state.db.get().await?;
-        
-        let rows = client.query_opt(
-            "SELECT user_id FROM sessions
-            WHERE session_id = $1 AND expires_at > NOW()", &[&session_id]
-        ).await?;
-
-        let Some(row) = rows else{
-            return Ok(Html(tokio::fs::read_to_string("pages/login.html").await?))
-        };
-        let user_id: uuid::Uuid = row.get("user_id");
-
-        let rows = client.query(
-            "SELECT contacts.contacts_id, users.nickname FROM contacts 
-            INNER JOIN users ON users.id = contacts.contacts_id
-            WHERE contacts.user_id = $1
-            ", 
-            &[&user_id]
-        ).await?;
-        
-        let mut contacts: HashMap<uuid::Uuid, String> = HashMap::new();
-        for row in rows{
-            let contacts_id = row.get("contacts_id");
-            let nickname = row.get("nickname");
-            println!("{}", contacts_id);
-            println!("{}", nickname);
-            contacts.insert(contacts_id, nickname);
-        }
-
-        println!("{:?}", contacts);
-        let html = {
-            if contacts.is_empty(){
-                //no contacts available
-                String::from("")
-            } 
-            else{
-                let mut buffer_string: String = String::new();
-                for (id, nickname) in &contacts{
-                    let button = format!("<button class='user' data-user-id='{id}'>{nickname}</button>"); 
-                    buffer_string.push_str(button.as_str());
-                }
-                buffer_string
-            }
-
-        };
-        println!("{}", html);
-        page = page.replace("Contacts", html.as_str());
-        Ok(Html(page))
-    } 
-    else{
-        Ok(Html(tokio::fs::read_to_string("pages/login.html").await?))
-    }
-}
-
-//
-#[derive(Debug, Deserialize)]
-struct LoginMessage{
-    message: Option<String>,
-}
-
-async fn loading_login(Query(query): Query<LoginMessage>) -> Result<Html<String>, ServerError> {
-    let mut page = tokio::fs::read_to_string("pages/login.html").await?; 
-    if let Some(message) = query.message {
-        let html = match message.as_str() {
-            "no_such_user" => "<h1>No such user</h1>",
-            "invalid_password" => "<h1>Invalid password</h1>",
-            _ => "", 
-        };
-        page = page.replace("Fill all of the fields", html);
-    } 
-
-    Ok(Html(page))
-
-}
-async fn login_handler(State(state): State<AppState>, jar: CookieJar, Form(data): Form<Login>) -> 
-         Result<(CookieJar, Redirect), ServerError> {
-    let client = state.db.get().await?;
-    let row = client.query_opt(
-        "SELECT id, nickname, password FROM users WHERE email = $1", 
-        &[&data.email]
-    ).await?;
-
-    let Some(row) = row else{
-        return Ok( (jar, Redirect::to("/login?message=no_such_user")) );
-    };
-
-    let user_id: uuid::Uuid = row.get("id");
-    let nickname: String = row.get("nickname");
-    let stored_password: String = row.get("password");
-
-    if data.password != stored_password {
-        return Ok( (jar, Redirect::to("/login?message=invalid_password")) );
-    }
-
-    let row = client.query_one(
-        "INSERT INTO sessions (user_id) VALUES ($1) RETURNING session_id",
-        &[&user_id]
-    ).await?;
-
-    let session_id: uuid::Uuid = row.get("session_id");
-
-    let cookie = Cookie::build(("session_id", session_id.to_string()))
-        .path("/")
-        .http_only(true)
-        .build();
-
-    Ok((jar.add(cookie), Redirect::to("/")))
-}
-
-#[derive(Debug, Deserialize)]
-struct RegisterMessage{
-    message: Option<String>,
-}
-async fn loading_register(Query(query): Query<AddContactMessage>) -> Result<Html<String>, ServerError>{
-    let mut page = tokio::fs::read_to_string("pages/register.html").await?;
-    if let Some(message) = query.message {
-        let html = match message.as_str() {
-            "no_at_sign" => "<h1>No @ sign in email</h1>",
-            "wrong_email_format" => "<h1>Wrong email format</h1>",
-            "wrong_password_format" => "<h1>Wrong password format</h1>",
-            _ => "", 
-        };
-        page = page.replace("Fill all of the blanks", html);
-    } 
-
-    Ok(Html(page))
-}
-
-async fn register_handler(State(state): State<AppState>, Form(data): Form<Register>) -> Result<Redirect, ServerError>{
-    match checking_user_data(data.clone()){
-        Err(UserDataError::NoAtSign) => return Ok(Redirect::to("/register?message=no_at_sign")),
-        Err(UserDataError::EmailFormat) => return Ok(Redirect::to("/register?message=wrong_email_format")),
-        Err(UserDataError::PasswordFormat) => return Ok(Redirect::to("/register?message=wrong_password_format")),
-        _ => {}, 
-    }
-    let client = state.db.get().await?;
-
-    client.execute(
-        "INSERT INTO users (nickname, email, password) VALUES ($1, $2, $3)",
-        &[&data.nickname, &data.email, &data.password]
-    ).await?;
-
-    Ok(Redirect::to("/"))
-}
-
-//adding new user
-#[derive(Deserialize, Debug)]
-struct AddContactMessage{
-    message: Option<String>,
-}
-async fn loading_add_contact(Query(query): Query<AddContactMessage>) -> Result<Html<String>, ServerError>{
-    let mut page = tokio::fs::read_to_string("pages/add_contact.html").await?; 
-    if let Some(message) = query.message {
-        let html = match message.as_str() {
-            "error_finding_user" => "<h1>Error finding that user</h1>",
-            "already_in_contacts" => "<h1>User already in contacts</h1>",
-            "user_added" => "<h1>User added successfully</h1>",
-            _ => "", 
-        };
-        page = page.replace("Type a username", html);
-    } 
-
-    Ok(Html(page))
-}
-async fn add_contact_handler(
-        State(state): State<AppState>, 
-        jar: CookieJar,
-        Form(data): Form<AddContact>
-    )-> Result<Redirect, ServerError> {
-
-    let client = state.db.get().await?;
-   
-    if let Some(value) = get_cookie(&jar, "session_id"){
-        let session_id: uuid::Uuid = value.parse()
-            .map_err(|_| ServerError::HandleSocketError(
-                HandleSocketError::ParsingCookie
-            ))?;
-        let row = client.query_opt("
-                SELECT user_id FROM sessions 
-                WHERE sessions.session_id = $1 AND expires_at > NOW() 
-            ", &[&session_id]).await?;
-        let user_id: uuid::Uuid = match row {
-            Some(row) => row.get("user_id"),
-            None => {
-                return Ok(Redirect::to("/add_contact?message=error_finding_user"));
-            } 
-        };
-        let result: Result<Redirect, ServerError> = match client.query_opt(
-           "SELECT id FROM users WHERE users.nickname = $1", 
-            &[&data.nickname]
-        ).await{
-            Ok(Some(row)) => {
-                let contacts_id: uuid::Uuid = row.get("id");
-                match client.execute(
-                    "INSERT INTO contacts(user_id, contacts_id) 
-                    VALUES ($1, $2)",
-                    &[&user_id, &contacts_id]
-                ).await {
-                    Ok(_) => {
-                        Ok(Redirect::to("/add_contact?message=user_added"))
-                    },
-                    Err(_) => {
-                        Ok(Redirect::to("/add_contact?message=already_in_contacts"))
-                    }
-                }
-            }
-            Ok(None) => {
-                Ok(Redirect::to("/add_contact?message=error_finding_user"))
-            }
-            Err(e) => return Err(ServerError::TokioDb(e)),
-        };
-        result
-    } 
-    else{
-        return Ok(Redirect::to("/login"));
-    }
-}
-
-//websocket and msg sending handling
-async fn ws_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<AppState>,
-    jar: CookieJar,
-) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| async move {
-        if let Err(e) = handle_socket(socket, state, jar).await {
-            eprintln!("Websocket error: {e}");
-        }
-    })
-}
-
-async fn handle_socket(
-    mut socket: WebSocket,
-    state: AppState,
-    jar: CookieJar,
-) -> Result<(), ServerError> {
-    let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-
-    let session_id: uuid::Uuid = match get_cookie(&jar, "session_id"){
-        Some(value) => { match value.parse() {
-            Ok(value) => value,
-            Err(_) => return Err(ServerError::HandleSocketError(HandleSocketError::ParsingCookie)),
-        } }
-        None => return Err(ServerError::HandleSocketError(HandleSocketError::RetrievingCookie)),
-    }; 
-
-    let client = state.db.get().await?;
-    let row = client.query_opt(
-       "SELECT user_id FROM sessions 
-        INNER JOIN users ON users.id = sessions.user_id
-        WHERE sessions.session_id = $1 AND sessions.expires_at > NOW()", 
-        &[&session_id]
-    ).await?;
-   
-    let user_id: uuid::Uuid = match row {
-        Some(row) => row.get("user_id"),
-        None => return Err(ServerError::HandleSocketError(HandleSocketError::UserNotFound)),
-    };
-
-    let mut users = state.users.write().await;
-    users.insert(user_id, tx);
-    drop(users);
-    loop{
-        tokio::select! {
-            //receiving msg from socket 
-            Some(msg) = rx.recv() => {
-                let json = serde_json::to_string(&msg)?;
-
-                socket
-                    .send(axum::extract::ws::Message::Text(json.into()))
-                    .await?;
-            }
-
-            //writing a msg to socket 
-            Some(Ok(ws_msg)) = socket.recv() => {
-                if let axum::extract::ws::Message::Text(text) = ws_msg {
-                    let msg: Message = serde_json::from_str(&text)?;
-                    client.execute(
-                        "INSERT INTO messages(sender_id, received_id, contents) 
-                        VALUES ($1, $2, $3)",
-                        &[&user_id, &msg.receiver_id, &msg.contents]
-                    ).await?;
-                    let users = state.users.read().await;
-
-                    if let Some(receiver_tx) = users.get(&msg.receiver_id){
-                        let _ = receiver_tx.send(msg);
-                    }
-                }
-            }
-            else => {
-                break;
-            }
-        }
-    }   
-
-    Ok(())
-}
+mod auth;
+mod contacts;
+mod home;
+mod models;
+mod websocket;
 
 fn create_app(state: AppState) -> Router{
     Router::new()
-        .route("/", get(home_handler))
-        .route("/register", get(loading_register).post(register_handler))
-        .route("/login", get(loading_login).post(login_handler))
-        .route("/add_contact", get(loading_add_contact).post(add_contact_handler))
-        .route("/ws", get(ws_handler))
+        .route("/", get(home::home_handler))
+        .route("/register", get(auth::loading_register).post(auth::register_handler))
+        .route("/login", get(auth::loading_login).post(auth::login_handler))
+        .route("/add_contact", get(contacts::loading_add_contact).post(contacts::add_contact_handler))
+        .route("/ws", get(websocket::ws_handler))
         .nest_service("/img", ServeDir::new("pages/img"))
         .nest_service("/js", ServeDir::new("pages/js"))
         .with_state(state)
@@ -360,7 +50,7 @@ async fn main() -> Result<(), ServerError>{
         Ok(_) => {},
         Err(_) => {println!("Database was already created. Skipping creating another one");}
     } 
-    let (client, connection) = tokio_postgres::connect(
+    let (_client, connection) = tokio_postgres::connect(
         format!("host={} user={} password={} dbname={}",
                 std::env::var("POSTGRES_HOST")?,
                 std::env::var("POSTGRES_USER")?,

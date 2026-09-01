@@ -1,4 +1,4 @@
-use axum::{extract::ws::WebSocket, http::StatusCode, response::IntoResponse};
+use axum::{http::StatusCode, response::IntoResponse};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use std::{fmt, env, collections::HashMap, sync::Arc};
