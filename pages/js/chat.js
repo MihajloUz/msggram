@@ -10,11 +10,9 @@ socket.onmessage = (event) => {
 
     const h1 = document.createElement("h1");
     h1.textContent = msg.contents;
+    h1.style.color = "blue";
 
     document.body.appendChild(h1);
-
-    console.log("Received:", msg);
-
 };
 
 socket.onclose = () => {
@@ -34,9 +32,18 @@ document.querySelectorAll(".user").forEach(button => {
 });
 
 document.getElementById("send_button").addEventListener("click", () => {
+    if (receiverId === null) {
+        return;
+    }
+
+
+    const h1 = document.createElement("h1");
+    h1.textContent = document.getElementById("msg_input").value;
+    document.body.appendChild(h1);
+    h1.style.color = "red";
+
     socket.send(JSON.stringify({
         receiver_id: receiverId,
         contents: document.getElementById("msg_input").value
     }));
 });
-
